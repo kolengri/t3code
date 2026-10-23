@@ -2272,6 +2272,16 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         const stopped = (yield* orchestrator.getThreadShell(threadId))?.pullRequests?.[0];
         assert.isUndefined(stopped?.watch);
         assert.deepEqual(stopped?.endedWatch, started);
+        yield* orchestrator.dispatch({
+          ...link,
+          type: "thread.pull-request.unlink",
+          commandId: CommandId.make(`automatic-pr-unlink-${source}`),
+        });
+        yield* orchestrator.dispatch({
+          ...link,
+          commandId: CommandId.make(`automatic-pr-restore-${source}`),
+        });
+        assert.isDefined((yield* orchestrator.getThreadShell(threadId))?.pullRequests?.[0]?.watch);
       }),
   );
 
@@ -2373,6 +2383,8 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
     "open",
     "closed",
     "merged",
+    "legacy-replacement",
+    "dismissed-legacy-replacement",
     "unlinked-before-discovery",
     "stopped-before-run",
   ] as const)(
@@ -2380,6 +2392,8 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
     (scenario) =>
       Effect.gen(function* () {
         const state = scenario === "closed" || scenario === "merged" ? scenario : "open";
+        const replacesLegacy =
+          scenario === "legacy-replacement" || scenario === "dismissed-legacy-replacement";
         const orchestrator = yield* Orchestrator.OrchestratorV2;
         const maintenance = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
         const threadId = ThreadId.make(`discovered-pr-watch-${scenario}`);
@@ -2411,6 +2425,19 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
           number: 9,
           url: "https://github.com/pingdotgg/t3code/pull/9",
         };
+        const previousLegacy = {
+          ...branchPullRequest,
+          number: 8,
+          url: "https://github.com/pingdotgg/t3code/pull/8",
+        };
+        if (replacesLegacy) {
+          yield* orchestrator.dispatch({
+            type: "thread.metadata.update",
+            commandId: CommandId.make(`discovered-pr-legacy-link-${scenario}`),
+            threadId,
+            linkedPullRequest: previousLegacy,
+          });
+        }
         const sync = Effect.fn("test.syncDiscoveredPullRequest")(function* (
           suffix: string,
           reference: typeof branchPullRequest | null = branchPullRequest,
@@ -2427,13 +2454,56 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
               workspaceRoot: "/workspace/discovered-pr",
               branch: "feature/discovered-pr",
               worktreePath: null,
-              linkedPullRequest: null,
+              linkedPullRequest: thread?.linkedPullRequest ?? null,
               branchPullRequest: thread?.branchPullRequest ?? null,
             },
             branchPullRequest: reference,
             branchPullRequestState: state,
+            ...(replacesLegacy && suffix === "first"
+              ? { linkedPullRequest: branchPullRequest }
+              : {}),
           });
         });
+        if (scenario === "dismissed-legacy-replacement") {
+          const key = {
+            threadId,
+            host: "github.com",
+            repository: branchPullRequest.repository,
+            number: branchPullRequest.number,
+          };
+          const link = {
+            ...key,
+            type: "thread.pull-request.link" as const,
+            url: branchPullRequest.url,
+            source: "agent" as const,
+          };
+          yield* orchestrator.dispatch({
+            ...link,
+            commandId: CommandId.make("dismissed-legacy-link"),
+          });
+          yield* orchestrator.dispatch({
+            ...key,
+            type: "thread.pull-request.unlink",
+            commandId: CommandId.make("dismissed-legacy-unlink"),
+          });
+          assert.isTrue((yield* maintenance.rebuild).valid);
+          yield* sync("first");
+          const after = yield* orchestrator.getThreadShell(threadId);
+          const dismissed = after?.pullRequests?.find((entry) => entry.number === 9);
+          assert.equal(dismissed?.source, "stack-dismissed");
+          assert.isUndefined(dismissed?.watch);
+          assert.equal(after?.linkedPullRequest?.number, previousLegacy.number);
+          yield* orchestrator.dispatch({
+            ...link,
+            commandId: CommandId.make("dismissed-legacy-explicit-restore"),
+          });
+          assert.isDefined(
+            (yield* orchestrator.getThreadShell(threadId))?.pullRequests?.find(
+              (entry) => entry.number === 9,
+            )?.watch,
+          );
+          return;
+        }
         if (scenario === "unlinked-before-discovery") {
           const key = {
             threadId,
@@ -2517,7 +2587,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         }
         yield* orchestrator.dispatch({
           type: "thread.pull-request.watch",
-          commandId: CommandId.make("discovered-pr-unwatch"),
+          commandId: CommandId.make(`discovered-pr-unwatch-${scenario}`),
           threadId,
           host: "github.com",
           repository: branchPullRequest.repository,
@@ -2530,7 +2600,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         );
         yield* orchestrator.dispatch({
           type: "thread.pull-request.unlink",
-          commandId: CommandId.make("discovered-pr-unlink"),
+          commandId: CommandId.make(`discovered-pr-unlink-${scenario}`),
           threadId,
           host: "github.com",
           repository: branchPullRequest.repository,

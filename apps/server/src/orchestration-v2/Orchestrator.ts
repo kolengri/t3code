@@ -594,7 +594,10 @@ function hasLiveRun(projection: Pick<OrchestrationV2ThreadProjection, "runs">): 
   );
 }
 
-function initialPullRequestWatch(startedAt: string): ThreadPullRequestWatch {
+function initialPullRequestWatch(
+  startedAt: string,
+  endedWatch?: ThreadPullRequestWatch,
+): ThreadPullRequestWatch {
   return {
     startedAt,
     headSha: null,
@@ -605,6 +608,18 @@ function initialPullRequestWatch(startedAt: string): ThreadPullRequestWatch {
     remarksThrough: startedAt,
     remarkIds: [],
     wakes: 0,
+    // A restored watch must not repeat check or conflict news its last watch reported.
+    ...(endedWatch && {
+      headSha: endedWatch.headSha,
+      failedChecks: endedWatch.failedChecks,
+      passed: endedWatch.passed,
+      passedChecks: endedWatch.passedChecks,
+      conflicting: endedWatch.conflicting,
+    }),
+    ...(endedWatch?.owedChecks !== undefined && { owedChecks: endedWatch.owedChecks }),
+    ...(endedWatch?.checksAwaitedSince !== undefined && {
+      checksAwaitedSince: endedWatch.checksAwaitedSince,
+    }),
   };
 }
 
@@ -3411,23 +3426,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                 : existing.watch
               : !command.watching
                 ? undefined
-                : (existing.watch ?? {
-                    ...initialPullRequestWatch(startedAt),
-                    // Watching again must not repeat check or conflict news the last watch told.
-                    ...(existing.endedWatch && {
-                      headSha: existing.endedWatch.headSha,
-                      failedChecks: existing.endedWatch.failedChecks,
-                      passed: existing.endedWatch.passed,
-                      passedChecks: existing.endedWatch.passedChecks,
-                      conflicting: existing.endedWatch.conflicting,
-                    }),
-                    ...(existing.endedWatch?.owedChecks !== undefined && {
-                      owedChecks: existing.endedWatch.owedChecks,
-                    }),
-                    ...(existing.endedWatch?.checksAwaitedSince !== undefined && {
-                      checksAwaitedSince: existing.endedWatch.checksAwaitedSince,
-                    }),
-                  });
+                : (existing.watch ?? initialPullRequestWatch(startedAt, existing.endedWatch));
           if (watch === existing.watch && links === linked) return thread;
           const final =
             command.type === "thread.pull-request-watch.sync" && watch === undefined
@@ -3444,13 +3443,32 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           };
         }
         case "thread.pull-request.sync": {
+          const branch = command.branchPullRequest;
+          const suppliedReplacement = command.linkedPullRequest;
+          const replacement =
+            suppliedReplacement !== undefined &&
+            threadPullRequestsOf(thread).some(
+              (link) =>
+                link.source === "stack-dismissed" &&
+                threadPullRequestKeysEqual(link, legacyThreadPullRequestKey(suppliedReplacement)),
+            )
+              ? undefined
+              : suppliedReplacement;
+          const ownedReplacement =
+            command.branchPullRequestState === "open" &&
+            branch !== null &&
+            replacement !== undefined &&
+            threadPullRequestKeysEqual(
+              legacyThreadPullRequestKey(replacement),
+              legacyThreadPullRequestKey(branch),
+            );
           const synced = {
             ...thread,
             branchPullRequest: command.branchPullRequest,
-            ...(command.linkedPullRequest === undefined
+            ...(replacement === undefined
               ? {}
               : {
-                  linkedPullRequest: command.linkedPullRequest,
+                  linkedPullRequest: replacement,
                   pullRequests: [
                     ...threadPullRequestsOf(thread).filter(
                       (link) =>
@@ -3462,21 +3480,22 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                           )
                         ) &&
                         !(
-                          command.linkedPullRequest &&
-                          threadPullRequestKeysEqual(
-                            link,
-                            legacyThreadPullRequestKey(command.linkedPullRequest),
-                          )
+                          replacement &&
+                          threadPullRequestKeysEqual(link, legacyThreadPullRequestKey(replacement))
                         ),
                     ),
-                    ...(command.linkedPullRequest
-                      ? [legacyPullRequestLink(thread, command.linkedPullRequest, now)]
+                    ...(replacement
+                      ? [
+                          {
+                            ...legacyPullRequestLink(thread, replacement, now),
+                            ...(ownedReplacement && { source: "created" as const }),
+                          },
+                        ]
                       : []),
                   ],
                 }),
             updatedAt: thread.updatedAt,
           };
-          const branch = command.branchPullRequest;
           if (
             command.branchPullRequestState !== "open" ||
             branch === null ||
@@ -3524,7 +3543,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     })();
     // Linking and starting the watch commit together, so agent omissions and a racing
     // unwatch cannot leave a newly owned PR without observation or restart a stopped watch.
-    const previousLinks = threadPullRequestsOf(thread);
+    const previousLinks = visibleThreadPullRequests(threadPullRequestsOf(thread));
     const newOwnedLinks = threadPullRequestsOf(updatedThread).filter(
       (link) =>
         (link.source === "created" || link.source === "agent") &&
@@ -3545,11 +3564,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         .pipe(mapDispatchError(command));
       const latest = latestExecutedRun(runs);
       if (latest === null || !(yield* stopReachedRun(command, command.threadId, latest.id))) {
-        const watch = initialPullRequestWatch(DateTime.formatIso(now));
+        const startedAt = DateTime.formatIso(now);
         updatedThread = {
           ...updatedThread,
           pullRequests: threadPullRequestsOf(updatedThread).map((link) =>
-            newOwnedLinks.includes(link) ? { ...link, watch } : link,
+            newOwnedLinks.includes(link)
+              ? withPullRequestWatch(link, initialPullRequestWatch(startedAt, link.endedWatch))
+              : link,
           ),
         };
       }
