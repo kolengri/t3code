@@ -236,7 +236,7 @@ export function pullRequestWatchMessage(input: {
     "",
     exhausted
       ? `T3 Code stopped watching after ${PULL_REQUEST_WATCH_WAKE_LIMIT} comment-only updates in a row. Call watch_pull_request to watch it again.`
-      : "Look into each item and act on it as your task requires. T3 Code keeps watching and wakes you on the next change, so end your turn when you are done. When you hand the work back to the user, call unwatch_pull_request first so the thread returns to their inbox.",
+      : "Look into each item and act on it as your task requires. T3 Code keeps watching and wakes you on the next change, so end your turn when you are done. After fixing review feedback, run the appropriate checks and push the fix, then resolve only the corresponding addressed review threads. Leave unresolved or disputed feedback open. If the host denies resolution or it is unavailable, report that gap and leave the thread open. Resolving a discussion does not approve the pull request. Keep watching after a push or a progress/final report. Call unwatch_pull_request only when the user asks to stop monitoring or explicitly hands remaining PR work to someone else.",
   ].join("\n");
   const failed = changes.some(
     (change) => change.kind === "checks-failed" || change.kind === "conflicting",

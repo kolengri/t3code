@@ -24,9 +24,8 @@ export const ThreadLinkedPullRequest = Schema.Struct({
 });
 export type ThreadLinkedPullRequest = typeof ThreadLinkedPullRequest.Type;
 
-/** `stack-dismissed` is a tombstone
- * for a native-stack member the user unlinked, so the sync reactor does not
- * re-add it; clients hide it. */
+/** `stack-dismissed` retains an explicitly unlinked identity so stack and branch discovery
+ * cannot re-add it. The persisted name also covers non-stack links; clients hide it. */
 export const ThreadPullRequestLinkSource = Schema.Literals([
   "manual",
   "created",

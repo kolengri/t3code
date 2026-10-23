@@ -594,6 +594,20 @@ function hasLiveRun(projection: Pick<OrchestrationV2ThreadProjection, "runs">): 
   );
 }
 
+function initialPullRequestWatch(startedAt: string): ThreadPullRequestWatch {
+  return {
+    startedAt,
+    headSha: null,
+    failedChecks: [],
+    passed: false,
+    passedChecks: [],
+    conflicting: false,
+    remarksThrough: startedAt,
+    remarkIds: [],
+    wakes: 0,
+  };
+}
+
 function withPullRequestWatch(
   link: ThreadPullRequestLink,
   watch: ThreadPullRequestWatch | undefined,
@@ -2733,7 +2747,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         .getThreadRecords(command.threadId, ["runs"])
         .pipe(mapDispatchError(command));
       const latest = latestExecutedRun(runs);
-      if (latest !== null && (yield* stopReachedRun(command, command.threadId, latest.id))) {
+      if (
+        thread.automaticPullRequestWatchPaused === true ||
+        (latest !== null && (yield* stopReachedRun(command, command.threadId, latest.id)))
+      ) {
         return yield* new OrchestratorDispatchError({
           commandId: command.commandId,
           commandType: command.type,
@@ -3070,7 +3087,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       }
       markUnreadVisitedAt = DateTime.subtract(latestRunCompletedAt, { milliseconds: 1 });
     }
-    const updatedThread: OrchestrationV2AppThread = (() => {
+    let updatedThread: OrchestrationV2AppThread = (() => {
       switch (command.type) {
         case "thread.archive":
           return {
@@ -3320,25 +3337,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             ];
           } else if (command.type === "thread.pull-request.unlink") {
             if (!existing) return thread;
-            const belongsToStack =
-              existing.source === "stack" ||
-              existing.stack !== null ||
-              links.some(
-                (link) =>
-                  link.host.toLowerCase() === key.host &&
-                  link.repository.toLowerCase() === key.repository &&
-                  link.stack?.layers.some((layer) => layer.number === key.number),
-              );
-            pullRequests = belongsToStack
-              ? links.map((link) =>
-                  link === existing
-                    ? {
-                        ...withPullRequestWatch(link, undefined),
-                        source: "stack-dismissed" as const,
-                      }
-                    : link,
-                )
-              : links.filter((link) => link !== existing);
+            pullRequests = links.map((link) =>
+              link === existing
+                ? {
+                    ...withPullRequestWatch(link, undefined),
+                    source: "stack-dismissed" as const,
+                  }
+                : link,
+            );
           } else {
             if (!existing) return thread;
             pullRequests = links.map((link) =>
@@ -3406,12 +3412,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               : !command.watching
                 ? undefined
                 : (existing.watch ?? {
-                    startedAt,
-                    headSha: null,
-                    failedChecks: [],
-                    passed: false,
-                    passedChecks: [],
-                    conflicting: false,
+                    ...initialPullRequestWatch(startedAt),
                     // Watching again must not repeat check or conflict news the last watch told.
                     ...(existing.endedWatch && {
                       headSha: existing.endedWatch.headSha,
@@ -3426,9 +3427,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                     ...(existing.endedWatch?.checksAwaitedSince !== undefined && {
                       checksAwaitedSince: existing.endedWatch.checksAwaitedSince,
                     }),
-                    remarksThrough: startedAt,
-                    remarkIds: [],
-                    wakes: 0,
                   });
           if (watch === existing.watch && links === linked) return thread;
           const final =
@@ -3445,8 +3443,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             updatedAt: command.type === "thread.pull-request.watch" ? now : thread.updatedAt,
           };
         }
-        case "thread.pull-request.sync":
-          return {
+        case "thread.pull-request.sync": {
+          const synced = {
             ...thread,
             branchPullRequest: command.branchPullRequest,
             ...(command.linkedPullRequest === undefined
@@ -3478,6 +3476,29 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                 }),
             updatedAt: thread.updatedAt,
           };
+          const branch = command.branchPullRequest;
+          if (
+            command.branchPullRequestState !== "open" ||
+            branch === null ||
+            (thread.branchPullRequest != null &&
+              threadPullRequestKeysEqual(
+                legacyThreadPullRequestKey(thread.branchPullRequest),
+                legacyThreadPullRequestKey(branch),
+              )) ||
+            threadPullRequestsOf(synced).some((link) =>
+              threadPullRequestKeysEqual(link, legacyThreadPullRequestKey(branch)),
+            )
+          ) {
+            return synced;
+          }
+          return {
+            ...synced,
+            pullRequests: [
+              ...threadPullRequestsOf(synced),
+              { ...legacyPullRequestLink(thread, branch, now), source: "created" },
+            ],
+          };
+        }
         case "thread.title.regeneration.complete":
           return thread.titleRegeneration?.requestId === command.requestId
             ? {
@@ -3501,6 +3522,38 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           };
       }
     })();
+    // Linking and starting the watch commit together, so agent omissions and a racing
+    // unwatch cannot leave a newly owned PR without observation or restart a stopped watch.
+    const previousLinks = threadPullRequestsOf(thread);
+    const newOwnedLinks = threadPullRequestsOf(updatedThread).filter(
+      (link) =>
+        (link.source === "created" || link.source === "agent") &&
+        link.watch === undefined &&
+        !previousLinks.some((previous) => threadPullRequestKeysEqual(previous, link)),
+    );
+    if (
+      newOwnedLinks.length > 0 &&
+      thread.automaticPullRequestWatchPaused !== true &&
+      thread.archivedAt === null &&
+      thread.settledOverride !== "settled" &&
+      thread.settledAt === null &&
+      thread.lineage.relationshipToParent !== "subagent" &&
+      !isProviderNativeSubagentThread(thread)
+    ) {
+      const { runs } = yield* projectionStore
+        .getThreadRecords(command.threadId, ["runs"])
+        .pipe(mapDispatchError(command));
+      const latest = latestExecutedRun(runs);
+      if (latest === null || !(yield* stopReachedRun(command, command.threadId, latest.id))) {
+        const watch = initialPullRequestWatch(DateTime.formatIso(now));
+        updatedThread = {
+          ...updatedThread,
+          pullRequests: threadPullRequestsOf(updatedThread).map((link) =>
+            newOwnedLinks.includes(link) ? { ...link, watch } : link,
+          ),
+        };
+      }
+    }
     if (
       command.type === "thread.pull-request-link.sync" ||
       command.type === "thread.pull-request-watch.sync"
@@ -5294,6 +5347,22 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ? projection.runs.filter((run) => run.status === "queued" && run.queueHeld === true)
         : [];
     const releasedAt = yield* DateTime.now;
+    if (
+      sentByUserFromClient &&
+      startsOrQueuesRun &&
+      projection.thread.automaticPullRequestWatchPaused === true
+    ) {
+      const event = yield* emit(
+        events,
+        command,
+      )({
+        type: "thread.metadata-updated",
+        threadId: command.threadId,
+        occurredAt: releasedAt,
+        payload: { ...projection.thread, automaticPullRequestWatchPaused: false },
+      });
+      projection = applyToProjection(projection, event);
+    }
     for (const held of heldRunsToRelease) {
       yield* emit(
         events,
@@ -9334,7 +9403,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       });
     }
     const pullRequests = thread.pullRequests ?? [];
-    if (pullRequests.some((link) => link.watch !== undefined)) {
+    if (
+      thread.automaticPullRequestWatchPaused !== true ||
+      pullRequests.some((link) => link.watch !== undefined)
+    ) {
       yield* emitEvent({
         type: "thread.pull-request-synced",
         threadId: thread.id,
@@ -9342,6 +9414,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         occurredAt: input.now,
         payload: {
           ...thread,
+          automaticPullRequestWatchPaused: true,
           pullRequests: pullRequests.map((link) => withPullRequestWatch(link, undefined)),
         },
       });
@@ -11612,7 +11685,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             payload: { ...run, queueHeld: false },
           });
         }
-        if (queued.length === 0) {
+        if (queued.length === 0 || projection.thread.automaticPullRequestWatchPaused === true) {
           yield* emit(
             events,
             command,
@@ -11620,7 +11693,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             type: "thread.metadata-updated",
             threadId: command.threadId,
             occurredAt: now,
-            payload: projection.thread,
+            payload: { ...projection.thread, automaticPullRequestWatchPaused: false },
           });
         }
         break;

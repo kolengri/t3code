@@ -44,6 +44,7 @@ import {
   OrchestrationGetTurnDiffResult,
 } from "./checkpointDiff.ts";
 import { ModelSelection } from "./modelSelection.ts";
+import { PullRequestState } from "./pullRequest.ts";
 import {
   ThreadLinkedPullRequest,
   ThreadPullRequestLink,
@@ -383,6 +384,8 @@ export const OrchestrationV2AppThread = Schema.Struct({
   worktreePath: Schema.NullOr(TrimmedNonEmptyString),
   linkedPullRequest: Schema.optional(Schema.NullOr(ThreadLinkedPullRequest)),
   pullRequests: Schema.optional(Schema.Array(ThreadPullRequestLink)),
+  /** Stop also suppresses automatic watches in threads that have never run. */
+  automaticPullRequestWatchPaused: Schema.optional(Schema.Boolean),
   branchPullRequest: Schema.optional(Schema.NullOr(ThreadLinkedPullRequest)),
   activeProviderThreadId: Schema.NullOr(ProviderThreadId),
   historyOrigin: Schema.optional(OrchestrationV2ThreadHistoryOrigin),
@@ -2764,6 +2767,7 @@ export const OrchestrationV2Command = Schema.Union([
       branchPullRequest: Schema.NullOr(ThreadLinkedPullRequest),
     }),
     branchPullRequest: Schema.NullOr(ThreadLinkedPullRequest),
+    branchPullRequestState: Schema.optional(PullRequestState),
     linkedPullRequest: Schema.optional(ThreadLinkedPullRequest),
   }),
   Schema.Struct({

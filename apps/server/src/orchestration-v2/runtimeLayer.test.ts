@@ -2113,7 +2113,9 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
       });
       assert.isTrue((yield* maintenance.rebuild).valid);
       assert.deepEqual(
-        (yield* orchestrator.getThreadShell(threadId))?.pullRequests?.map((link) => link.number),
+        (yield* orchestrator.getThreadShell(threadId))?.pullRequests
+          ?.filter((link) => link.source !== "stack-dismissed")
+          .map((link) => link.number),
         [2, 3, 4],
       );
     }),
@@ -2174,7 +2176,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
           number,
           source,
         })),
-        [{ number: 2, source: "stack-dismissed" }],
+        [1, 2].map((number) => ({ number, source: "stack-dismissed" })),
       );
       yield* orchestrator.dispatch({
         type: "thread.pull-request.link",
@@ -2186,12 +2188,16 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         source: "stack",
       });
       assert.equal(
-        (yield* orchestrator.getThreadShell(threadId))?.pullRequests?.[0]?.source,
+        (yield* orchestrator.getThreadShell(threadId))?.pullRequests?.find(
+          (link) => link.number === 2,
+        )?.source,
         "stack-dismissed",
       );
       assert.isTrue((yield* maintenance.rebuild).valid);
       assert.equal(
-        (yield* orchestrator.getThreadShell(threadId))?.pullRequests?.[0]?.source,
+        (yield* orchestrator.getThreadShell(threadId))?.pullRequests?.find(
+          (link) => link.number === 2,
+        )?.source,
         "stack-dismissed",
       );
       yield* orchestrator.dispatch({
@@ -2204,10 +2210,337 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         source: "manual",
       });
       assert.equal(
-        (yield* orchestrator.getThreadShell(threadId))?.pullRequests?.[0]?.source,
+        (yield* orchestrator.getThreadShell(threadId))?.pullRequests?.find(
+          (link) => link.number === 2,
+        )?.source,
         "manual",
       );
     }),
+  );
+
+  it.effect.each(["created", "agent"] as const)(
+    "automatically watches a newly linked owned pull request: %s",
+    (source) =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const maintenance = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
+        const threadId = ThreadId.make(`automatic-pr-watch-${source}`);
+        yield* orchestrator.dispatch({
+          type: "thread.create",
+          createdBy: "user",
+          creationSource: "web",
+          commandId: CommandId.make(`automatic-pr-create-${source}`),
+          threadId,
+          projectId: ProjectId.make("automatic-pr-project"),
+          title: "Automatically watch owned PRs",
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+        });
+        const link = {
+          type: "thread.pull-request.link" as const,
+          threadId,
+          host: "github.com",
+          repository: "pingdotgg/t3code",
+          number: 7,
+          url: "https://github.com/pingdotgg/t3code/pull/7",
+          source,
+        };
+        yield* orchestrator.dispatch({
+          ...link,
+          commandId: CommandId.make(`automatic-pr-link-${source}`),
+        });
+        const started = (yield* orchestrator.getThreadShell(threadId))?.pullRequests?.[0]?.watch;
+        assert.isDefined(started);
+        assert.isTrue((yield* maintenance.rebuild).valid);
+        assert.deepEqual(
+          (yield* orchestrator.getThreadShell(threadId))?.pullRequests?.[0]?.watch,
+          started,
+        );
+        yield* orchestrator.dispatch({
+          ...link,
+          type: "thread.pull-request.watch",
+          commandId: CommandId.make(`automatic-pr-unwatch-${source}`),
+          watching: false,
+        });
+        yield* orchestrator.dispatch({
+          ...link,
+          commandId: CommandId.make(`automatic-pr-relink-${source}`),
+        });
+        const stopped = (yield* orchestrator.getThreadShell(threadId))?.pullRequests?.[0];
+        assert.isUndefined(stopped?.watch);
+        assert.deepEqual(stopped?.endedWatch, started);
+      }),
+  );
+
+  it.effect.each(["manual", "stack", "settled", "archived", "subagent", "stopped"] as const)(
+    "does not automatically watch an ineligible pull request link: %s",
+    (mode) =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        let threadId = ThreadId.make(`ineligible-pr-watch-${mode}`);
+        yield* orchestrator.dispatch({
+          type: "thread.create",
+          createdBy: "user",
+          creationSource: "web",
+          commandId: CommandId.make(`ineligible-pr-create-${mode}`),
+          threadId,
+          projectId: ProjectId.make("ineligible-pr-project"),
+          title: "Do not watch references or inactive threads",
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+        });
+        if (mode === "settled" || mode === "archived") {
+          yield* orchestrator.dispatch({
+            type: mode === "settled" ? "thread.settle" : "thread.archive",
+            commandId: CommandId.make(`ineligible-pr-state-${mode}`),
+            threadId,
+          });
+        } else if (mode === "subagent") {
+          const parent = yield* orchestrator.getThreadProjection(threadId);
+          const sink = yield* EventSink.EventSinkV2;
+          const now = yield* DateTime.now;
+          const childId = ThreadId.make("ineligible-pr-child");
+          yield* sink.write({
+            events: [
+              {
+                id: EventId.make("ineligible-pr-child-created"),
+                type: "thread.created",
+                threadId: childId,
+                providerInstanceId: modelSelection.instanceId,
+                occurredAt: now,
+                payload: {
+                  ...parent.thread,
+                  id: childId,
+                  lineage: {
+                    parentThreadId: threadId,
+                    rootThreadId: threadId,
+                    relationshipToParent: "subagent",
+                  },
+                },
+              },
+            ],
+          });
+          threadId = childId;
+        } else if (mode === "stopped") {
+          yield* seedProject({
+            projectId: ProjectId.make("ineligible-pr-project"),
+            title: "Stopped PR task",
+            workspaceRoot: "/workspace/ineligible-pr",
+            defaultModelSelection: null,
+            createdAt: "2026-10-01T00:00:00.000Z",
+          });
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            createdBy: "user",
+            creationSource: "web",
+            commandId: CommandId.make("ineligible-pr-message"),
+            threadId,
+            messageId: MessageId.make("ineligible-pr-message"),
+            text: "Create a PR.",
+            attachments: [],
+            modelSelection,
+            dispatchMode: { type: "start_immediately" },
+          });
+          yield* orchestrator.dispatch({
+            type: "thread.stop",
+            commandId: CommandId.make("ineligible-pr-stop"),
+            threadId,
+          });
+        }
+        yield* orchestrator.dispatch({
+          type: "thread.pull-request.link",
+          commandId: CommandId.make(`ineligible-pr-link-${mode}`),
+          threadId,
+          host: "github.com",
+          repository: "pingdotgg/t3code",
+          number: 7,
+          url: "https://github.com/pingdotgg/t3code/pull/7",
+          source: mode === "manual" || mode === "stack" ? mode : "agent",
+        });
+        const link = (yield* orchestrator.getThreadShell(threadId))?.pullRequests?.[0];
+        assert.isDefined(link);
+        assert.isUndefined(link?.watch);
+      }),
+  );
+
+  it.effect.each([
+    "open",
+    "closed",
+    "merged",
+    "unlinked-before-discovery",
+    "stopped-before-run",
+  ] as const)(
+    "automatically watches only a newly discovered open branch pull request: %s",
+    (scenario) =>
+      Effect.gen(function* () {
+        const state = scenario === "closed" || scenario === "merged" ? scenario : "open";
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const maintenance = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
+        const threadId = ThreadId.make(`discovered-pr-watch-${scenario}`);
+        const projectId = ProjectId.make(`discovered-pr-project-${scenario}`);
+        yield* seedProject({
+          projectId,
+          title: "Branch PR discovery",
+          workspaceRoot: "/workspace/discovered-pr",
+          defaultModelSelection: null,
+          createdAt: "2026-10-01T00:00:00.000Z",
+        });
+        yield* orchestrator.dispatch({
+          type: "thread.create",
+          createdBy: "user",
+          creationSource: "web",
+          commandId: CommandId.make(`discovered-pr-create-${scenario}`),
+          threadId,
+          projectId,
+          title: "Discover and watch a branch PR",
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: "feature/discovered-pr",
+          worktreePath: null,
+        });
+        const branchPullRequest = {
+          projectId,
+          repository: "pingdotgg/t3code",
+          number: 9,
+          url: "https://github.com/pingdotgg/t3code/pull/9",
+        };
+        const sync = Effect.fn("test.syncDiscoveredPullRequest")(function* (
+          suffix: string,
+          reference: typeof branchPullRequest | null = branchPullRequest,
+        ) {
+          const snapshot = yield* orchestrator.getShellSnapshot();
+          const thread = yield* orchestrator.getThreadShell(threadId);
+          yield* orchestrator.dispatch({
+            type: "thread.pull-request.sync",
+            commandId: CommandId.make(`discovered-pr-sync-${scenario}-${suffix}`),
+            threadId,
+            projectId,
+            snapshotSequence: snapshot.snapshotSequence,
+            expected: {
+              workspaceRoot: "/workspace/discovered-pr",
+              branch: "feature/discovered-pr",
+              worktreePath: null,
+              linkedPullRequest: null,
+              branchPullRequest: thread?.branchPullRequest ?? null,
+            },
+            branchPullRequest: reference,
+            branchPullRequestState: state,
+          });
+        });
+        if (scenario === "unlinked-before-discovery") {
+          const key = {
+            threadId,
+            host: "github.com",
+            repository: branchPullRequest.repository,
+            number: branchPullRequest.number,
+          };
+          yield* orchestrator.dispatch({
+            type: "thread.pull-request.link",
+            commandId: CommandId.make("discovered-pr-link-before-discovery"),
+            ...key,
+            url: branchPullRequest.url,
+            source: "agent",
+          });
+          yield* orchestrator.dispatch({
+            type: "thread.pull-request.unlink",
+            commandId: CommandId.make("discovered-pr-unlink-before-discovery"),
+            ...key,
+          });
+          assert.isTrue((yield* maintenance.rebuild).valid);
+          yield* sync("after-early-unlink");
+          const links = (yield* orchestrator.getThreadShell(threadId))?.pullRequests;
+          assert.equal(links?.[0]?.source, "stack-dismissed");
+          assert.isUndefined(links?.[0]?.watch);
+          yield* sync("away", null);
+          yield* sync("back");
+          const after = (yield* orchestrator.getThreadShell(threadId))?.pullRequests;
+          assert.equal(after?.[0]?.source, "stack-dismissed");
+          assert.isUndefined(after?.[0]?.watch);
+          return;
+        }
+        yield* sync("first");
+        const links = (yield* orchestrator.getThreadShell(threadId))?.pullRequests ?? [];
+        if (state !== "open") {
+          assert.deepEqual(links, []);
+          return;
+        }
+        assert.equal(links[0]?.source, "created");
+        assert.isDefined(links[0]?.watch);
+        if (scenario === "stopped-before-run") {
+          yield* orchestrator.dispatch({
+            type: "thread.stop",
+            commandId: CommandId.make("discovered-pr-stop-before-run"),
+            threadId,
+          });
+          assert.isTrue((yield* maintenance.rebuild).valid);
+          const another = {
+            ...branchPullRequest,
+            number: 10,
+            url: "https://github.com/pingdotgg/t3code/pull/10",
+          };
+          yield* sync("while-stopped", another);
+          assert.isUndefined(
+            (yield* orchestrator.getThreadShell(threadId))?.pullRequests?.find(
+              (link) => link.number === 10,
+            )?.watch,
+          );
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            createdBy: "user",
+            creationSource: "web",
+            commandId: CommandId.make("discovered-pr-resume"),
+            threadId,
+            messageId: MessageId.make("discovered-pr-resume"),
+            text: "Continue work on another PR.",
+            attachments: [],
+            modelSelection,
+            dispatchMode: { type: "start_immediately" },
+          });
+          yield* sync("resumed", {
+            ...branchPullRequest,
+            number: 11,
+            url: "https://github.com/pingdotgg/t3code/pull/11",
+          });
+          assert.isDefined(
+            (yield* orchestrator.getThreadShell(threadId))?.pullRequests?.find(
+              (link) => link.number === 11,
+            )?.watch,
+          );
+          return;
+        }
+        yield* orchestrator.dispatch({
+          type: "thread.pull-request.watch",
+          commandId: CommandId.make("discovered-pr-unwatch"),
+          threadId,
+          host: "github.com",
+          repository: branchPullRequest.repository,
+          number: branchPullRequest.number,
+          watching: false,
+        });
+        yield* sync("after-unwatch");
+        assert.isUndefined(
+          (yield* orchestrator.getThreadShell(threadId))?.pullRequests?.[0]?.watch,
+        );
+        yield* orchestrator.dispatch({
+          type: "thread.pull-request.unlink",
+          commandId: CommandId.make("discovered-pr-unlink"),
+          threadId,
+          host: "github.com",
+          repository: branchPullRequest.repository,
+          number: branchPullRequest.number,
+        });
+        yield* sync("after-unlink");
+        const dismissed = (yield* orchestrator.getThreadShell(threadId))?.pullRequests;
+        assert.equal(dismissed?.[0]?.source, "stack-dismissed");
+        assert.isUndefined(dismissed?.[0]?.watch);
+      }),
   );
 
   it.effect("starts, records, and stops a pull request watch", () =>
@@ -3196,14 +3529,6 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         url,
         source: "agent",
       });
-      yield* orchestrator.dispatch({
-        type: "thread.pull-request.watch",
-        commandId: CommandId.make(`pr-watch-wake-start-${mode}`),
-        threadId,
-        ...key,
-        watching: true,
-      });
-
       const at = "2026-10-02T12:00:00.000Z";
       const detail = watchedPullRequestDetail({ projectId, number: key.number, at });
       const initialWatch = (yield* orchestrator.getThreadShell(threadId))?.pullRequests?.[0]?.watch;
