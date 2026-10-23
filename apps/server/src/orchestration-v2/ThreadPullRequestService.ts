@@ -320,6 +320,9 @@ export const make = Effect.gen(function* () {
                     branchPullRequest: thread.branchPullRequest ?? null,
                   },
                   branchPullRequest,
+                  ...(detected?.state === "open" && branchPullRequest !== null
+                    ? { branchPullRequestState: detected.state }
+                    : {}),
                   ...(replacement === undefined ? {} : { linkedPullRequest: replacement }),
                 });
                 pendingBackfill.delete(thread.id);
