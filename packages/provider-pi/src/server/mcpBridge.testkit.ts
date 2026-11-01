@@ -47,6 +47,7 @@ export async function loadMcpBridge(
     readonly toolSearchDisabled?: boolean;
     readonly allowsTool?: (name: string) => boolean;
     readonly runtimeMode?: string;
+    readonly toolOrder?: ReadonlyArray<string>;
   } = {},
 ) {
   const handlers = new Map<string, AgentStartHook>();
@@ -114,7 +115,11 @@ export async function loadMcpBridge(
       requests.push(request);
       const result =
         request.method === "tools/list"
-          ? { tools: catalog }
+          ? {
+              tools: options.toolOrder
+                ? options.toolOrder.map((name) => catalog.find((tool) => tool.name === name)!)
+                : catalog,
+            }
           : request.method === "tools/call"
             ? (options.result ?? { content: [{ type: "text", text: "browser snapshot" }] })
             : {};
