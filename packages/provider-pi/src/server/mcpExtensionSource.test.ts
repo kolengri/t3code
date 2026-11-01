@@ -165,6 +165,39 @@ describe("Pi MCP tool exposure", () => {
     ui: { notify: () => undefined },
   };
 
+  it.each([false, true])(
+    "registers identical tool definitions in canonical order with modern Pi %s",
+    async (modern) => {
+      const toolOrder = [
+        "delegate_task",
+        "orchestrator_capabilities",
+        "preview_snapshot",
+        "task_status",
+      ];
+      const first = await loadMcpBridge({ modern, toolSearchAvailable: true, toolOrder });
+      const reordered = await loadMcpBridge({
+        modern,
+        toolSearchAvailable: true,
+        toolOrder: toolOrder.toReversed(),
+      });
+      const definitions = (bridge: typeof first) =>
+        bridge.tools.map(({ execute: _execute, ...definition }) => definition);
+
+      assert.deepEqual(definitions(reordered), definitions(first));
+      assert.deepEqual(
+        reordered.tools.filter((tool) => tool.exposure !== "hidden").map((tool) => tool.name),
+        toolOrder.map((name) => `mcp__t3-code__${name}`),
+      );
+      for (const tool of reordered.tools) {
+        await tool.execute("ordered-call", { depth: 2 });
+        assert.deepEqual(JSON.parse(JSON.stringify(reordered.requests.at(-1)?.params)), {
+          name: tool.name.replace(/^mcp__t3[-_]code__/, ""),
+          arguments: { depth: 2 },
+        });
+      }
+    },
+  );
+
   it.each(["session_start", "session_tree", "model_select", "before_agent_start"])(
     "declares optional T3 tools for OpenAI-compatible gateways at %s",
     async (hookName) => {
@@ -203,19 +236,19 @@ describe("Pi MCP tool exposure", () => {
         .filter((tool) => tool.exposure !== "hidden")
         .map((tool) => [tool.name, tool.exposure]),
       [
-        ["mcp__t3-code__orchestrator_capabilities", "direct"],
         ["mcp__t3-code__delegate_task", "direct"],
-        ["mcp__t3-code__task_status", "direct"],
+        ["mcp__t3-code__orchestrator_capabilities", "direct"],
         ["mcp__t3-code__preview_snapshot", "deferred"],
+        ["mcp__t3-code__task_status", "direct"],
       ],
     );
     assert.deepEqual(
       bridge.tools.filter((tool) => tool.exposure === "hidden").map((tool) => tool.name),
       [
-        "mcp__t3_code__orchestrator_capabilities",
         "mcp__t3_code__delegate_task",
-        "mcp__t3_code__task_status",
+        "mcp__t3_code__orchestrator_capabilities",
         "mcp__t3_code__preview_snapshot",
+        "mcp__t3_code__task_status",
       ],
     );
     const result = await bridge.tools

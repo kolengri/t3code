@@ -400,7 +400,9 @@ export default async function t3McpExtension(pi: ExtensionAPI) {
     const attempt = (async () => {
       const signal = AbortSignal.timeout(10_000);
       await client.connect(signal);
-      catalog = await client.listTools(signal);
+      catalog = [...await client.listTools(signal)].sort((left, right) =>
+        left.name < right.name ? -1 : left.name > right.name ? 1 : 0,
+      );
       registerTools();
     })();
     started = attempt;
